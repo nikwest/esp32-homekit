@@ -25,8 +25,8 @@
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof(array[0]))
 
 #if 1
-#define EXAMPLE_ESP_WIFI_SSID "nikwest"
-#define EXAMPLE_ESP_WIFI_PASS "eilemitweile!"
+#define EXAMPLE_ESP_WIFI_SSID "unibj"
+#define EXAMPLE_ESP_WIFI_PASS "12673063"
 #endif
 #if 0
 #define EXAMPLE_ESP_WIFI_SSID "NO_RUN"
