@@ -45,8 +45,7 @@ const int WIFI_GOT_IP6_BIT = BIT1;
 
 static void* acc;
 static void* _ev_handle[NUM_CHANNELS];
-static bool leds[NUM_CHANNELS];
-static i2c_dev_t pcf8575;
+static pcf857x_t pcf8575;
 
 typedef union {
 	uint16_t raw;
@@ -76,36 +75,51 @@ typedef union {
 
 static state_t gpios;
 
-void* led_read(void* arg)
-{
-    int i = (int) arg;
-    printf("[MAIN] LED %d READ %d\n", i, leds[i]);
-    return (void*)leds[i];
+static inline void set_gpio_out(int pos, bool val, bool write) {
+    if (val) {
+        gpios.out |= 1 << pos;
+    } else {
+        gpios.out &= ~(1 << pos);
+    } 
+    if(write) {
+        ESP_ERROR_CHECK(pcf857x_write(&pcf8575, gpios.raw));
+        if (_ev_handle[pos]) {
+            hap_event_response(acc, _ev_handle[pos], (void*) val);
+        }
+    }
 }
 
-void led_write(void* arg, void* value, int len)
-{
+static inline bool get_gpio_out(int pos, bool read) {
+    if(read) {
+        ESP_ERROR_CHECK(pcf857x_read(&pcf8575, &gpios.raw));
+    }
+    if(pos == -1) {
+        return read;
+    }
+    return  (gpios.out & (1 << pos)) ? true : false;
+}
+
+void* led_read(void* arg) {
     int i = (int) arg;
-    printf("[MAIN] LED %d WRITE. %d\n", i, (int)value);
+    bool val = get_gpio_out(i, false);
+    ESP_LOGD(TAG, "LED %d READ %d\n", i, val);
+    return (void*)val;
+}
 
-    if (value) {
-        leds[i] = true;
-        gpios.out |= 1 << i;
+void led_write(void* arg, void* val, int len) {
+    if(len < sizeof(int)) {
+        ESP_LOGE(TAG, "argument is not an int. Size too small %d", len);
+        return;
     }
-    else {
-        leds[i] = false;
-        gpios.out &= ~(1 << i);
-    } 
-    pcf8575_port_write(&pcf8575, gpios.raw);
+    int i = (int) arg;
+    bool value = (bool) val;
+    ESP_LOGD(TAG, "LED %d WRITE. %c\n", i, value);
+    set_gpio_out(i, value, true);
 
-    if (_ev_handle[i]) {
-        hap_event_response(acc, _ev_handle[i], (void*) leds[i]);
-    }
     return;
 }
 
-void led_notify(void* arg, void* ev_handle, bool enable)
-{
+void led_notify(void* arg, void* ev_handle, bool enable) {
     int i = (int) arg;
     if (enable) {
         _ev_handle[i] = ev_handle;
@@ -115,13 +129,11 @@ void led_notify(void* arg, void* ev_handle, bool enable)
     }
 }
 
-void* identify_read(void* arg)
-{
+void* identify_read(void* arg) {
     return (void*)true;
 }
 
-void hap_object_init(void* arg)
-{
+void hap_object_init(void* arg) {
     void* accessory_object = hap_accessory_add(acc);
     struct hap_characteristic cs[] = {
         {HAP_CHARACTER_IDENTIFY, (void*)true, NULL, identify_read, NULL, NULL},
@@ -135,7 +147,7 @@ void hap_object_init(void* arg)
 
     for(int i=0; i < NUM_CHANNELS; i++) {
         struct hap_characteristic cc[] = {
-            {HAP_CHARACTER_ON, (void*) leds[i], (void*) i, led_read, led_write, led_notify}
+            {HAP_CHARACTER_ON, (void*) get_gpio_out(i, false), (void*) i, led_read, led_write, led_notify}
         };
         hap_service_and_characteristics_add(acc, accessory_object, HAP_SERVICE_SWITCHS, cc, ARRAY_SIZE(cc));
     }
@@ -213,29 +225,58 @@ void wifi_init_sta()
              EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
 }
 
-void pcf8575_init() {
+void pcf8575_run_test() {
+    uint16_t write = 0;
+    uint16_t read = 0xFF;
+    for(int i=0; i<256; i++) {
+        if(pcf857x_write(&pcf8575, write) != ESP_OK) {
+            ESP_LOGE(TAG, "Could not test write to pcf8575\n");
+            continue;
+        }
+        if(pcf857x_read(&pcf8575, &read) != ESP_OK) {
+            ESP_LOGE(TAG, "Could not test read from pcf8575\n");
+            continue;
+        } 
+        if(read != write) {
+            ESP_LOGE(TAG, "Couldn't read what was written: %u vs %u\n", read, write);
+        }
+        write++;
+    }
+
+}
+
+void handle_pcf8575_interrupt(uint16_t value) {
+    ESP_LOGI(TAG, "handle_pcf8575_interrupt\n");
+    for(int i=0; i<NUM_CHANNELS; i++) {
+        if( (value & (1 << i)) == 0) {
+            ESP_LOGI(TAG, "toggle %d\n", i);
+            set_gpio_out(i, !get_gpio_out(i, false), true);
+        }
+    }
+}
+
+void init_pcf8575() {
     while(i2cdev_init() != ESP_OK) {
         ESP_LOGE(TAG, "Could not init I2Cdev library\n");
         vTaskDelay(250 / portTICK_PERIOD_MS);
     }
 
-    while( pcf857x_init_desc(&pcf8575, I2C_BUS, PCF8575_ADDR, I2C_SDA_PIN, I2C_SCL_PIN) != ESP_OK) {
+    while( pcf857x_init(&pcf8575, PCF8575, I2C_BUS, PCF8575_ADDR, I2C_SDA_PIN, I2C_SCL_PIN) != ESP_OK) {
         ESP_LOGE(TAG, "Could not init device descriptor\n");
         vTaskDelay(250 / portTICK_PERIOD_MS);
     }
-    pcf8575_port_read(&pcf8575, &gpios.raw);
-    for(int i=0; i<NUM_CHANNELS; i++) {
-        leds[i] = (gpios.out & (1 << i)) ? true : false;
-    }
+    // read all in
+    get_gpio_out(-1, true);
+
+    pcf857x_set_interrupt_handler(&pcf8575, IRQ_PIN, handle_pcf8575_interrupt);    
+
+    //pcf8575_run_test();
 }
 
 void app_main()
 {
     ESP_ERROR_CHECK( nvs_flash_init() );
 
-    //gpio_pad_select_gpio(LED_PORT);
-    //gpio_set_direction(LED_PORT, GPIO_MODE_OUTPUT);
-
-    pcf8575_init();
+    init_pcf8575();
     wifi_init_sta();
 }
